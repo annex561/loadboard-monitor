@@ -1,64 +1,44 @@
 /**
- * Autonomous Sacred Cube Loadboard Monitor — Railway Edition
- * ----------------------------------------------------------
- * Runs as a standalone Railway service. Every 2 minutes:
- * 1. Logs into Sacred Cube via Pakistan proxy (IPRoyal)
- * 2. Searches loadboard for SB loads from TN
- * 3. Deduplicates by postingId against Railway Postgres
- * 4. INSERTs new loads INSTANTLY into TRAQ IQ loads table
- * 5. Syncs to Google Sheet (optional)
- * 6. Daily sheet refresh at midnight — clears and starts fresh
+ * Autonomous Sacred Cube Loadboard Monitor v2.1 (Railway Edition)
+ * Fixed: Manual cookie management instead of axios-cookiejar-support
  */
 
 import axios from 'axios';
-import { wrapper } from 'axios-cookiejar-support';
 import { CookieJar } from 'tough-cookie';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import * as cheerio from 'cheerio';
 import pg from 'pg';
 const { Client } = pg;
 
-// ─── CONFIG (all from env vars) ────────────────────────────────────────
+// ─── CONFIG ───────────────────────────────────────────────────────────
 const CONFIG = {
-  // Sacred Cube
   loginUrl: 'https://access-control.sacredcube.co/login',
   tmsBase: 'https://tms.sacredcube.co',
   loadboardApi: 'https://tms.sacredcube.co/nova-vendor/loadboard/loadsAggregate',
   email: process.env.SC_EMAIL || 'annex561@gmail.com',
   password: process.env.SC_PASSWORD,
-
-  // Pakistan Proxy
   proxyHost: process.env.PROXY_HOST || 'geo.iproyal.com',
   proxyPort: process.env.PROXY_PORT || '12321',
   proxyUser: process.env.PROXY_USER,
   proxyPass: process.env.PROXY_PASS,
-
-  // Database
   databaseUrl: process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL,
-
-  // Google Sheet (optional)
   sheetId: '1AQ-vAhewUVmE-86Z3D_M3KYJg3lzvK5Q-w1horGrgI4',
-  googleServiceAccountKey: process.env.GOOGLE_SERVICE_ACCOUNT_KEY,
-
-  // Search
   origin: process.env.SEARCH_ORIGIN || 'TN',
   equipmentTypes: (process.env.EQUIPMENT_TYPES || 'SB').split(','),
   dhOrigin: parseInt(process.env.DH_ORIGIN || '150'),
   dhDest: parseInt(process.env.DH_DEST || '150'),
-
-  // Timing
   intervalMs: parseInt(process.env.INTERVAL_MS || '120000'),
   sessionRefreshMs: parseInt(process.env.SESSION_REFRESH_MS || '1800000'),
 };
 
-// ─── GLOBALS ─────────────────────────────────────────────────
+// ─── GLOBALS ──────────────────────────────────────────────────────────
 let csrfToken = null;
-let httpClient = null;
+let cookieString = '';
 let lastLoginTime = 0;
 let checkCount = 0;
 let totalInserted = 0;
 
-// ─── PROXY ───────────────────────────────────────────────────
+// ─── PROXY ────────────────────────────────────────────────────────────
 function getProxyAgent() {
   if (!CONFIG.proxyUser || !CONFIG.proxyPass) {
     console.warn('No proxy credentials — requests go direct');
@@ -68,50 +48,77 @@ function getProxyAgent() {
   return new HttpsProxyAgent(proxyUrl);
 }
 
-// ─── LOGIN ───────────────────────────────────────────────────
+// ─── COOKIE HELPER ────────────────────────────────────────────────────
+function extractCookies(resp) {
+  const setCookies = resp.headers['set-cookie'];
+  if (!setCookies) return;
+  const newCookies = (Array.isArray(setCookies) ? setCookies : [setCookies])
+    .map(c => c.split(';')[0]);
+  const existing = cookieString ? cookieString.split('; ') : [];
+  const map = {};
+  [...existing, ...newCookies].forEach(c => {
+    const [k] = c.split('=');
+    map[k] = c;
+  });
+  cookieString = Object.values(map).join('; ');
+}
+
+// ─── LOGIN ────────────────────────────────────────────────────────────
 async function login() {
   console.log('Logging into Sacred Cube...');
-  const jar = new CookieJar();
   const agent = getProxyAgent();
+  cookieString = '';
 
-  const axiosConfig = {
-    jar,
-    withCredentials: true,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    },
-    timeout: 30000,
+  const baseHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   };
 
-  httpClient = wrapper(axios.create(axiosConfig));
+  // Step 1: GET login page (no proxy needed)
+  const loginPage = await axios.get(CONFIG.loginUrl, {
+    headers: baseHeaders,
+    maxRedirects: 5,
+    validateStatus: () => true,
+  });
+  extractCookies(loginPage);
 
-  // Step 1: GET login page
-  const loginPage = await httpClient.get(CONFIG.loginUrl);
   const $ = cheerio.load(loginPage.data);
   csrfToken = $('meta[name="csrf-token"]').attr('content') || $('input[name="_token"]').val();
   if (!csrfToken) throw new Error('No CSRF token on login page');
+  console.log('  CSRF token obtained');
 
   // Step 2: POST credentials
-  await httpClient.post(CONFIG.loginUrl, new URLSearchParams({
+  const postResp = await axios.post(CONFIG.loginUrl, new URLSearchParams({
     _token: csrfToken,
     email: CONFIG.email,
     password: CONFIG.password,
   }).toString(), {
     headers: {
+      ...baseHeaders,
       'Content-Type': 'application/x-www-form-urlencoded',
       'X-CSRF-TOKEN': csrfToken,
       'Referer': CONFIG.loginUrl,
+      'Cookie': cookieString,
     },
     maxRedirects: 5,
+    validateStatus: () => true,
   });
+  extractCookies(postResp);
+  console.log('  Login POST done, status:', postResp.status);
 
-  // Step 3: Visit TMS loadboard via proxy
+  // Step 3: Visit TMS loadboard via proxy to get TMS session
   const proxyConfig = agent ? { httpsAgent: agent, httpAgent: agent } : {};
-  const tmsPage = await httpClient.get(`${CONFIG.tmsBase}/loadboard/turbo`, {
+  const tmsPage = await axios.get(`${CONFIG.tmsBase}/loadboard/turbo`, {
     ...proxyConfig,
-    headers: { 'Accept': 'text/html', 'Referer': CONFIG.loginUrl },
+    headers: {
+      ...baseHeaders,
+      'Referer': CONFIG.loginUrl,
+      'Cookie': cookieString,
+    },
+    maxRedirects: 5,
+    validateStatus: () => true,
   });
+  extractCookies(tmsPage);
 
   const $tms = cheerio.load(tmsPage.data);
   const tmsCsrf = $tms('meta[name="csrf-token"]').attr('content');
@@ -131,7 +138,7 @@ async function login() {
   console.log('  Login OK');
 }
 
-// ─── SEARCH ──────────────────────────────────────────────────
+// ─── SEARCH ───────────────────────────────────────────────────────────
 function buildPayload() {
   const today = new Date();
   const tomorrow = new Date(today);
@@ -165,7 +172,7 @@ async function searchLoadboard() {
   const agent = getProxyAgent();
   const proxyConfig = agent ? { httpsAgent: agent, httpAgent: agent } : {};
 
-  const res = await httpClient.post(CONFIG.loadboardApi, buildPayload(), {
+  const res = await axios.post(CONFIG.loadboardApi, buildPayload(), {
     ...proxyConfig,
     headers: {
       'Content-Type': 'application/json',
@@ -173,12 +180,13 @@ async function searchLoadboard() {
       'X-CSRF-TOKEN': csrfToken,
       'X-Requested-With': 'XMLHttpRequest',
       'Referer': `${CONFIG.tmsBase}/loadboard/turbo`,
+      'Cookie': cookieString,
     },
   });
   return res.data;
 }
 
-// ─── EXTRACT ─────────────────────────────────────────────────
+// ─── EXTRACT ──────────────────────────────────────────────────────────
 function extractLoads(response) {
   const loads = [];
   for (const src of ['DAT', 'TRUCKSTOP', 'SYLECTUS', '123LOADBOARD', 'DOFT', 'TRUCKERPATH']) {
@@ -191,14 +199,17 @@ function extractLoads(response) {
   return loads;
 }
 
-// ─── DATABASE INSERT + DEDUP ───────────────────────────────────
+// ─── DATABASE INSERT + DEDUP ──────────────────────────────────────────
 async function insertNewLoads(loads) {
   if (!CONFIG.databaseUrl) {
     console.warn('  No DATABASE_URL — skipping DB insert');
     return [];
   }
 
-  const db = new Client({ connectionString: CONFIG.databaseUrl, ssl: CONFIG.databaseUrl.includes('railway.internal') ? false : { rejectUnauthorized: false } });
+  const db = new Client({
+    connectionString: CONFIG.databaseUrl,
+    ssl: CONFIG.databaseUrl.includes('railway.internal') ? false : { rejectUnauthorized: false },
+  });
   await db.connect();
 
   try {
@@ -238,7 +249,7 @@ async function insertNewLoads(loads) {
         );
         newLoads.push(l);
       } catch (e) {
-        if (!e.message.includes('duplicate')) console.error(`  Insert err: ${e.message}`);
+        if (!e.message.includes('duplicate')) console.error('  Insert err:', e.message);
       }
     }
     return newLoads;
@@ -247,7 +258,7 @@ async function insertNewLoads(loads) {
   }
 }
 
-// ─── MAIN CHECK ──────────────────────────────────────────────
+// ─── MAIN CHECK ───────────────────────────────────────────────────────
 async function runCheck() {
   try {
     if (Date.now() - lastLoginTime > CONFIG.sessionRefreshMs) {
@@ -266,7 +277,7 @@ async function runCheck() {
     console.log(`${allLoads.length} total, ${newLoads.length} new (${totalInserted} total inserted)`);
 
     if (newLoads.length > 0) {
-      console.log(`  NEW LOADS:`);
+      console.log('  NEW LOADS:');
       newLoads.sort((a, b) => (b.offer || 0) - (a.offer || 0));
       newLoads.slice(0, 5).forEach(l => {
         const rpm = l.offer && l.tripMiles ? `$${(l.offer / l.tripMiles).toFixed(2)}/mi` : '';
@@ -274,21 +285,22 @@ async function runCheck() {
       });
     }
   } catch (err) {
-    console.error(`Check failed: ${err.message}`);
+    console.error('Check failed:', err.message);
     if (err.response?.status === 401 || err.response?.status === 419) {
       lastLoginTime = 0;
     }
   }
 }
 
-// ─── START ───────────────────────────────────────────────────
+// ─── START ────────────────────────────────────────────────────────────
 async function main() {
-  console.log('Sacred Cube Loadboard Monitor v2.0');
+  console.log('Sacred Cube Loadboard Monitor v2.1');
   console.log(`Origin: ${CONFIG.origin} | Equipment: ${CONFIG.equipmentTypes.join(',')}`);
   console.log(`Interval: ${CONFIG.intervalMs / 1000}s | DB: ${CONFIG.databaseUrl ? 'YES' : 'NO'}`);
 
   if (!CONFIG.password) {
-    console.error('SC_PASSWORD required'); process.exit(1);
+    console.error('SC_PASSWORD required');
+    process.exit(1);
   }
 
   await login();
