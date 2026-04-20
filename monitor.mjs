@@ -1,5 +1,4 @@
-import axios from 'axios';
-import { HttpsProxyAgent } from 'https-proxy-agent';
+import { ProxyAgent } from 'undici';
 import * as cheerio from 'cheerio';
 import pg from 'pg';
 const { Client } = pg;
@@ -19,43 +18,38 @@ const CONFIG = {
 let sessionCookies = '';
 let csrfToken = '';
 
-// ââ Proxy âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ââ Proxy (undici ProxyAgent â IPRoyal recommended) âââââââââââââââââââââ
 function getProxyAgent() {
-  // Build proxy URL WITHOUT encodeURIComponent â the underscore in
-  // _country-pk was being encoded to %5Fcountry-pk which broke auth.
   const proxyUrl = `http://${CONFIG.proxyUser}:${CONFIG.proxyPass}@${CONFIG.proxyHost}:${CONFIG.proxyPort}`;
   console.log(`  Proxy URL: http://${CONFIG.proxyUser}:${CONFIG.proxyPass.substring(0,6)}****@${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
-  return new HttpsProxyAgent(proxyUrl);
+  return new ProxyAgent(proxyUrl);
 }
 
 // ââ Test proxy connectivity âââââââââââââââââââââââââââââââââââââââââââââ
 async function testProxy() {
   console.log('\n=== PROXY CONNECTIVITY TEST ===');
-  const agent = getProxyAgent();
+  const dispatcher = getProxyAgent();
   try {
-    const res = await axios.get('https://ipv4.icanhazip.com', {
-      httpsAgent: agent,
-      timeout: 15000,
+    const res = await fetch('https://ipv4.icanhazip.com', {
+      dispatcher,
+      signal: AbortSignal.timeout(15000),
       headers: { 'User-Agent': 'Mozilla/5.0' },
     });
+    const body = await res.text();
     console.log(`  Status: ${res.status}`);
-    console.log(`  IP:     ${res.data.trim()}`);
+    console.log(`  IP:     ${body.trim()}`);
     console.log('  Proxy is WORKING');
     return true;
   } catch (err) {
     console.error(`  Proxy test FAILED: ${err.message}`);
-    if (err.response) {
-      console.error(`  Response status: ${err.response.status}`);
-      console.error(`  Response headers: ${JSON.stringify(err.response.headers)}`);
-    }
     return false;
   }
 }
 
 // ââ Cookie helper âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-function extractCookies(res) {
-  const raw = res.headers['set-cookie'];
-  if (!raw) return '';
+function extractCookies(headers) {
+  const raw = headers.getSetCookie ? headers.getSetCookie() : [];
+  if (!raw.length) return '';
   return raw.map(c => c.split(';')[0]).join('; ');
 }
 
@@ -73,60 +67,64 @@ function mergeCookies(existing, incoming) {
   return Object.values(map).join('; ');
 }
 
+// ââ Fetch helper with proxy ââââââââââââââââââââââââââââââââââââââââââââ
+async function proxyFetch(url, options = {}) {
+  const dispatcher = getProxyAgent();
+  const defaults = {
+    dispatcher,
+    signal: AbortSignal.timeout(30000),
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      ...(options.headers || {}),
+    },
+    redirect: options.redirect || 'follow',
+  };
+  return fetch(url, { ...defaults, ...options, headers: { ...defaults.headers, ...(options.headers || {}) }, dispatcher });
+}
+
 // ââ Login âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function login() {
   console.log('\n=== LOGIN FLOW ===');
-  const agent = getProxyAgent();
 
-  // Step 1 â GET login page (works without proxy, but we use proxy anyway)
+  // Step 1 â GET login page
   console.log('Step 1: GET /login');
-  const loginPage = await axios.get('https://access-control.sacredcube.co/login', {
-    httpsAgent: agent,
-    timeout: 30000,
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-  });
+  const loginPage = await proxyFetch('https://access-control.sacredcube.co/login');
   console.log(`  Status: ${loginPage.status}`);
-  sessionCookies = extractCookies(loginPage);
+  sessionCookies = extractCookies(loginPage.headers);
 
-  const $ = cheerio.load(loginPage.data);
+  const html = await loginPage.text();
+  const $ = cheerio.load(html);
   csrfToken = $('meta[name="csrf-token"]').attr('content') || $('input[name="_token"]').val();
   console.log(`  CSRF: ${csrfToken ? csrfToken.substring(0, 10) + '...' : 'NOT FOUND'}`);
 
   // Step 2 â POST login
   console.log('Step 2: POST /login');
-  const loginRes = await axios.post('https://access-control.sacredcube.co/login',
-    new URLSearchParams({
+  const loginRes = await proxyFetch('https://access-control.sacredcube.co/login', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Cookie': sessionCookies,
+    },
+    body: new URLSearchParams({
       _token: csrfToken,
       email: CONFIG.scEmail,
       password: CONFIG.scPassword,
     }).toString(),
-    {
-      httpsAgent: agent,
-      timeout: 30000,
-      maxRedirects: 0,
-      validateStatus: s => s < 400 || s === 302,
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': sessionCookies,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      },
-    }
-  );
+  });
   console.log(`  Status: ${loginRes.status}`);
-  sessionCookies = mergeCookies(sessionCookies, extractCookies(loginRes));
+  sessionCookies = mergeCookies(sessionCookies, extractCookies(loginRes.headers));
+  // Consume body even if we don't need it (prevents resource leak)
+  await loginRes.text();
 
   // Step 3 â Follow redirect to TMS
   console.log('Step 3: GET /tms (follow redirect)');
-  const tmsPage = await axios.get('https://access-control.sacredcube.co/tms', {
-    httpsAgent: agent,
-    timeout: 30000,
-    headers: {
-      'Cookie': sessionCookies,
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    },
+  const tmsPage = await proxyFetch('https://access-control.sacredcube.co/tms', {
+    headers: { 'Cookie': sessionCookies },
   });
   console.log(`  Status: ${tmsPage.status}`);
-  sessionCookies = mergeCookies(sessionCookies, extractCookies(tmsPage));
+  sessionCookies = mergeCookies(sessionCookies, extractCookies(tmsPage.headers));
+  await tmsPage.text(); // consume body
   console.log(`  Cookies: ${sessionCookies.substring(0, 60)}...`);
   console.log('Login complete.');
 }
@@ -155,43 +153,36 @@ function buildPayload() {
 // ââ Loadboard search ââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function searchLoadboard() {
   console.log('\n=== SEARCHING LOADBOARD ===');
-  const agent = getProxyAgent();
   const payload = buildPayload();
 
   try {
-    const res = await axios.post(
+    const res = await proxyFetch(
       'https://access-control.sacredcube.co/nova-vendor/loadboard/loadsAggregate',
-      payload,
       {
-        httpsAgent: agent,
-        timeout: 30000,
+        method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
           'Cookie': sessionCookies,
           'X-CSRF-TOKEN': csrfToken,
           'X-Requested-With': 'XMLHttpRequest',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           'Referer': 'https://access-control.sacredcube.co/tms',
         },
+        body: JSON.stringify(payload),
       }
     );
     console.log(`  Status: ${res.status}`);
-    console.log(`  Data type: ${typeof res.data}`);
-    if (Array.isArray(res.data)) {
-      console.log(`  Results: ${res.data.length} loads`);
-    } else if (res.data && res.data.data) {
-      console.log(`  Results: ${res.data.data.length} loads (nested)`);
+    const data = await res.json();
+    if (Array.isArray(data)) {
+      console.log(`  Results: ${data.length} loads`);
+    } else if (data && data.data) {
+      console.log(`  Results: ${data.data.length} loads (nested)`);
     } else {
-      console.log(`  Response keys: ${Object.keys(res.data || {}).join(', ')}`);
+      console.log(`  Response keys: ${Object.keys(data || {}).join(', ')}`);
     }
-    return res.data;
+    return data;
   } catch (err) {
     console.error(`  Search FAILED: ${err.message}`);
-    if (err.response) {
-      console.error(`  Status: ${err.response.status}`);
-      console.error(`  Body: ${JSON.stringify(err.response.data).substring(0, 300)}`);
-    }
     return null;
   }
 }
@@ -276,17 +267,13 @@ async function runCheck() {
     if (loads.length) await insertNewLoads(loads);
   } catch (err) {
     console.error(`\nFATAL ERROR: ${err.message}`);
-    if (err.response) {
-      console.error(`  Status: ${err.response.status}`);
-      console.error(`  Headers: ${JSON.stringify(err.response.headers)}`);
-    }
     console.error(err.stack);
   }
 }
 
 // ââ Main ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function main() {
-  console.log('Loadboard Monitor v2.2 starting...');
+  console.log('Loadboard Monitor v2.3 starting...');
   console.log(`Email: ${CONFIG.scEmail}`);
   console.log(`Proxy: ${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
   console.log(`Proxy user: ${CONFIG.proxyUser}`);
