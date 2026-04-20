@@ -1,6 +1,7 @@
 import { ProxyAgent } from 'undici';
 import * as cheerio from 'cheerio';
 import pg from 'pg';
+import net from 'net';
 const { Client } = pg;
 
 // ââ Config ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -18,16 +19,41 @@ const CONFIG = {
 let sessionCookies = '';
 let csrfToken = '';
 
-// ââ Proxy (undici ProxyAgent â IPRoyal recommended) âââââââââââââââââââââ
+// ââ Singleton proxy agent âââââââââââââââââââââââââââââââââââââââââââââââ
+let _proxyAgent = null;
 function getProxyAgent() {
-  const proxyUrl = `http://${CONFIG.proxyUser}:${CONFIG.proxyPass}@${CONFIG.proxyHost}:${CONFIG.proxyPort}`;
-  console.log(`  Proxy URL: http://${CONFIG.proxyUser}:${CONFIG.proxyPass.substring(0,6)}****@${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
-  return new ProxyAgent(proxyUrl);
+  if (_proxyAgent) return _proxyAgent;
+  const token = 'Basic ' + Buffer.from(`${CONFIG.proxyUser}:${CONFIG.proxyPass}`).toString('base64');
+  const uri = `http://${CONFIG.proxyHost}:${CONFIG.proxyPort}`;
+  console.log(`  Proxy URI: ${uri}`);
+  console.log(`  Proxy auth: Basic ${CONFIG.proxyUser}:${CONFIG.proxyPass.substring(0,6)}****`);
+  _proxyAgent = new ProxyAgent({ uri, token });
+  return _proxyAgent;
+}
+
+// ââ Raw TCP connectivity test âââââââââââââââââââââââââââââââââââââââââââ
+function testTcpConnect(host, port, timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    const sock = new net.Socket();
+    sock.setTimeout(timeoutMs);
+    sock.on('connect', () => { sock.destroy(); resolve(true); });
+    sock.on('error', (err) => { sock.destroy(); console.error(`  TCP error: ${err.message}`); resolve(false); });
+    sock.on('timeout', () => { sock.destroy(); console.error('  TCP timeout'); resolve(false); });
+    sock.connect(port, host);
+  });
 }
 
 // ââ Test proxy connectivity âââââââââââââââââââââââââââââââââââââââââââââ
 async function testProxy() {
   console.log('\n=== PROXY CONNECTIVITY TEST ===');
+
+  // Step 0: raw TCP check
+  console.log(`  Testing TCP to ${CONFIG.proxyHost}:${CONFIG.proxyPort}...`);
+  const tcpOk = await testTcpConnect(CONFIG.proxyHost, parseInt(CONFIG.proxyPort));
+  console.log(`  TCP connect: ${tcpOk ? 'OK' : 'FAILED'}`);
+  if (!tcpOk) return false;
+
+  // Step 1: proxy fetch through undici
   const dispatcher = getProxyAgent();
   try {
     const res = await fetch('https://ipv4.icanhazip.com', {
@@ -42,6 +68,9 @@ async function testProxy() {
     return true;
   } catch (err) {
     console.error(`  Proxy test FAILED: ${err.message}`);
+    if (err.cause) console.error(`  Cause: ${err.cause.message || JSON.stringify(err.cause)}`);
+    if (err.cause?.cause) console.error(`  Root cause: ${err.cause.cause.message}`);
+    console.error(`  Stack: ${err.stack}`);
     return false;
   }
 }
@@ -70,16 +99,17 @@ function mergeCookies(existing, incoming) {
 // ââ Fetch helper with proxy ââââââââââââââââââââââââââââââââââââââââââââ
 async function proxyFetch(url, options = {}) {
   const dispatcher = getProxyAgent();
-  const defaults = {
+  const merged = {
+    ...options,
     dispatcher,
-    signal: AbortSignal.timeout(30000),
+    signal: options.signal || AbortSignal.timeout(30000),
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       ...(options.headers || {}),
     },
     redirect: options.redirect || 'follow',
   };
-  return fetch(url, { ...defaults, ...options, headers: { ...defaults.headers, ...(options.headers || {}) }, dispatcher });
+  return fetch(url, merged);
 }
 
 // ââ Login âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
