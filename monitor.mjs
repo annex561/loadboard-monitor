@@ -1,4 +1,318 @@
 /**
+ * Autonomous Sacred Cube Loadboard Monitor v2.2 (Railway Edition)
+ * Fixed: Country targeting on password, added proxy diagnostics
+ */
+
+import axios from 'axios';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import * as cheerio from 'cheerio';
+import pg from 'pg';
+const { Client } = pg;
+
+// —— CONFIG ————————————————————————————————————————
+const CONFIG = {
+  loginUrl: 'https://access-control.sacredcube.co/login',
+  tmsBase: 'https://tms.sacredcube.co',
+  loadboardApi: 'https://tms.sacredcube.co/nova-vendor/loadboard/loadsAggregate',
+  email: process.env.SC_EMAIL || 'annex561@gmail.com',
+  password: process.env.SC_PASSWORD,
+  proxyHost: process.env.PROXY_HOST || 'geo.iproyal.com',
+  proxyPort: process.env.PROXY_PORT || '12321',
+  proxyUser: process.env.PROXY_USER,
+  proxyPass: process.env.PROXY_PASS,
+  databaseUrl: process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL,
+  sheetId: '1AQ-vAhewUVmE-86Z3D_M3KYJg3lzvK5Q-w1horGrgI4',
+  origin: process.env.SEARCH_ORIGIN || 'TN',
+  equipmentTypes: (process.env.EQUIPMENT_TYPES || 'SB').split(','),
+  dhOrigin: parseInt(process.env.DH_ORIGIN || '150'),
+  dhDest: parseInt(process.env.DH_DEST || '150'),
+  intervalMs: parseInt(process.env.INTERVAL_MS || '120000'),
+  sessionRefreshMs: parseInt(process.env.SESSION_REFRESH_MS || '1800000'),
+};
+
+// —— GLOBALS ———————————————————————————————————————
+let csrfToken = null;
+let cookieString = '';
+let lastLoginTime = 0;
+let checkCount = 0;
+let totalInserted = 0;
+
+function getProxyAgent() {
+  if (!CONFIG.proxyUser || !CONFIG.proxyPass) {
+    console.warn('No proxy credentials — requests go direct');
+    return undefined;
+  }
+  const proxyUrl = `http://${CONFIG.proxyUser}:${CONFIG.proxyPass}@${CONFIG.proxyHost}:${CONFIG.proxyPort}`;
+  console.log(`  Proxy URL: http://${CONFIG.proxyUser}:${CONFIG.proxyPass.substring(0,4)}****@${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
+  return new HttpsProxyAgent(proxyUrl);
+}
+
+async function testProxy() {
+  console.log('Testing proxy connectivity...');
+  const agent = getProxyAgent();
+  if (!agent) { console.log('  No proxy configured, skipping test'); return; }
+  try {
+    const res = await axios.get('https://ipv4.icanhazip.com', {
+      httpsAgent: agent,
+      httpAgent: agent,
+      timeout: 15000,
+      validateStatus: () => true,
+    });
+    console.log(`  Proxy test: status=${res.status}, ip=${String(res.data).trim()}`);
+  } catch (err) {
+    console.error(`  Proxy test FAILED: ${err.message}`);
+    if (err.response) {
+      console.error(`  Response status: ${err.response.status}`);
+      console.error(`  Response headers: ${JSON.stringify(err.response.headers)}`);
+    }
+  }
+}
+
+function extractCookies(resp) {
+  const setCookies = resp.headers['set-cookie'];
+  if (!setCookies) return;
+  const newCookies = (Array.isArray(setCookies) ? setCookies : [setCookies])
+    .map(c => c.split(';')[0]);
+  const existing = cookieString ? cookieString.split('; ') : [];
+  const map = {};
+  [...existing, ...newCookies].forEach(c => {
+    const [k] = c.split('=');
+    map[k] = c;
+  });
+  cookieString = Object.values(map).join('; ');
+}
+
+// —— LOGIN ————————————————————————————————————————
+async function login() {
+  console.log('Logging into Sacred Cube...');
+  const agent = getProxyAgent();
+  cookieString = '';
+
+  const baseHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  };
+
+  // Step 1: GET login page (no proxy needed)
+  const loginPage = await axios.get(CONFIG.loginUrl, {
+    headers: baseHeaders, maxRedirects: 5, validateStatus: () => true,
+  });
+  extractCookies(loginPage);
+  const $ = cheerio.load(loginPage.data);
+  csrfToken = $('meta[name="csrf-token"]').attr('content') || $('input[name="_token"]').val();
+  if (!csrfToken) throw new Error('No CSRF token on login page');
+  console.log('  CSRF token obtained');
+
+  // Step 2: POST credentials (no proxy)
+  const postResp = await axios.post(CONFIG.loginUrl, new URLSearchParams({
+    _token: csrfToken, email: CONFIG.email, password: CONFIG.password,
+  }).toString(), {
+    headers: { ...baseHeaders, 'Content-Type': 'application/x-www-form-urlencoded',
+      'X-CSRF-TOKEN': csrfToken, 'Referer': CONFIG.loginUrl, 'Cookie': cookieString },
+    maxRedirects: 5, validateStatus: () => true,
+  });
+  extractCookies(postResp);
+  console.log(`  Login POST done, status: ${postResp.status}`);
+
+  // Step 3: Visit TMS loadboard via proxy to get TMS session
+  const proxyConfig = agent ? { httpsAgent: agent, httpAgent: agent } : {};
+  try {
+    const tmsPage = await axios.get(`${CONFIG.tmsBase}/loadboard/turbo`, {
+      ...proxyConfig,
+      headers: { ...baseHeaders, 'Referer': CONFIG.loginUrl, 'Cookie': cookieString },
+      maxRedirects: 5, validateStatus: () => true,
+      timeout: 20000,
+    });
+    console.log(`  TMS page status: ${tmsPage.status}`);
+    extractCookies(tmsPage);
+
+    const $tms = cheerio.load(tmsPage.data);
+    const tmsCsrf = $tms('meta[name="csrf-token"]').attr('content');
+    if (tmsCsrf) csrfToken = tmsCsrf;
+
+    // Extract user/tenant from Inertia page props
+    const pageMatch = tmsPage.data.match(/data-page="([^"]+)"/);
+    if (pageMatch) {
+      try {
+        const pd = JSON.parse(pageMatch[1].replace(/&quot;/g, '"'));
+        if (pd.props?.currentUser) CONFIG._user = pd.props.currentUser;
+        if (pd.props?.currentTenant) CONFIG._tenant = pd.props.currentTenant;
+        console.log(`  Got user: ${CONFIG._user?.name}, tenant: ${CONFIG._tenant?.title}`);
+      } catch {}
+    }
+  } catch (err) {
+    console.error(`  TMS page via proxy failed: ${err.message}`);
+  }
+
+  lastLoginTime = Date.now();
+  console.log('  Login OK');
+}
+
+// —— SEARCH ———————————————————————————————————————
+function buildPayload() {
+  const today = new Date();
+  const tomorrow = new Date(today);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const fmt = d => d.toISOString().split('T')[0];
+
+  return {
+    origin: CONFIG.origin, 'dh-o': CONFIG.dhOrigin,
+    dest: '', 'dh-d': CONFIG.dhDest,
+    length: null, weight: null, 'full-partial': 'both',
+    'look-in-time': 24,
+    'start-date': fmt(today), 'end-date': fmt(tomorrow),
+    sortOption: 'Age', sortDirection: 'Ascending',
+    loadboards: ['ALL'],
+    user: CONFIG._user || {
+      id: 1, global_id: '8f2370df-b4f5-47f9-96d4-0d58adeec120',
+      name: 'Alex cius', email: 'annex561@gmail.com',
+      active: true, external: false, blocked: false,
+      canImpersonate: true, impersonating: false,
+    },
+    tenant: CONFIG._tenant || { id: 5297, title: 'Lamp', hasTrial: false, isTrialExpired: false, trialExpiryWarning: null },
+    searchDetails: {
+      DAT: { id: 'MTY0', queryId: '9_7B5NyOsv7Y2F-DCqcbkcIpbwVxIxdOLWMhUU3ieio' },
+      '123LOADBOARD': {}, TRUCKSTOP: { queryId: null }, TRUCKERPATH: {}, SYLECTUS: { queryId: null },
+    },
+    etypes: CONFIG.equipmentTypes,
+  };
+}
+
+async function searchLoadboard() {
+  const agent = getProxyAgent();
+  const proxyConfig = agent ? { httpsAgent: agent, httpAgent: agent } : {};
+  try {
+    const res = await axios.post(CONFIG.loadboardApi, buildPayload(), {
+      ...proxyConfig,
+      headers: {
+        'Content-Type': 'application/json', 'Accept': 'application/json',
+        'X-CSRF-TOKEN': csrfToken, 'X-Requested-With': 'XMLHttpRequest',
+        'Referer': `${CONFIG.tmsBase}/loadboard/turbo`, 'Cookie': cookieString,
+      },
+      timeout: 30000,
+    });
+    return res.data;
+  } catch (err) {
+    console.error(`  Search error: ${err.message}`);
+    if (err.response) {
+      console.error(`  Status: ${err.response.status}`);
+      console.error(`  Headers: ${JSON.stringify(err.response.headers || {})}`);
+      console.error(`  Body: ${typeof err.response.data === 'string' ? err.response.data.substring(0,500) : JSON.stringify(err.response.data).substring(0,500)}`);
+    }
+    throw err;
+  }
+}
+
+// —— DATA PROCESSING ————————————————————————————————
+function extractLoads(data) {
+  const loads = [];
+  if (!data) return loads;
+  const sources = Array.isArray(data) ? data : (data.results || data.loads || [data]);
+  for (const item of sources) {
+    const rows = item.loads || item.results || (Array.isArray(item) ? item : []);
+    for (const load of rows) {
+      const posting = load.postingId || load.id || load.referenceId;
+      if (!posting) continue;
+      loads.push({
+        postingId: posting,
+        origin_city: load.originCity || load.origin?.city || '',
+        origin_state: load.originState || load.origin?.state || '',
+        dest_city: load.destinationCity || load.destination?.city || '',
+        dest_state: load.destinationState || load.destination?.state || '',
+        pickup_date: load.pickupDate || load.earliestPickup || null,
+        delivery_date: load.deliveryDate || load.latestDelivery || null,
+        equipment: load.equipmentType || load.equipment || '',
+        weight: load.weight || null,
+        length: load.length || null,
+        rate: load.rate || load.ratePerMile || null,
+        miles: load.miles || load.distance || null,
+        company: load.company || load.carrierName || load.brokerName || '',
+        phone: load.phone || load.contactPhone || '',
+        loadboard: load.loadboard || load.source || '',
+        full_partial: load.fullPartial || 'Full',
+        comments: load.comments || '',
+        raw: JSON.stringify(load).substring(0, 2000),
+      });
+    }
+  }
+  return loads;
+}
+
+async function insertNewLoads(loads) {
+  if (!CONFIG.databaseUrl) { console.log('  No DB URL, skipping insert'); return 0; }
+  const client = new Client({ connectionString: CONFIG.databaseUrl, ssl: { rejectUnauthorized: false } });
+  await client.connect();
+  let inserted = 0;
+  try {
+    for (const l of loads) {
+      const dedupKey = `SC:${l.postingId}`;
+      const exists = await client.query('SELECT id FROM loads WHERE description = $1', [dedupKey]);
+      if (exists.rows.length > 0) continue;
+
+      await client.query(`INSERT INTO loads (
+        status, load_type, equipment_type, origin_city, origin_state,
+        destination_city, destination_state, pickup_date, delivery_date,
+        weight, length, rate, miles, description, company_name, contact_phone,
+        notes, created_at, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW(),NOW())`, [
+        'new', 'Full', l.equipment, l.origin_city, l.origin_state,
+        l.dest_city, l.dest_state, l.pickup_date, l.delivery_date,
+        l.weight, l.length, l.rate, l.miles, dedupKey, l.company, l.phone,
+        `${l.loadboard} | ${l.comments}`.substring(0, 500),
+      ]);
+      inserted++;
+    }
+  } finally {
+    await client.end();
+  }
+  return inserted;
+}
+
+// —— MAIN LOOP ————————————————————————————————————
+async function runCheck() {
+  checkCount++;
+  const now = new Date().toLocaleTimeString('en-US', { hour12: true });
+  process.stdout.write(`[\x1b[36m${now}\x1b[0m] #${checkCount} Searching... `);
+
+  try {
+    // Re-login if session expired
+    if (Date.now() - lastLoginTime > CONFIG.sessionRefreshMs) {
+      console.log('Session refresh needed');
+      await login();
+    }
+
+    const data = await searchLoadboard();
+    const loads = extractLoads(data);
+    const inserted = await insertNewLoads(loads);
+    totalInserted += inserted;
+
+    console.log(`Found ${loads.length} loads, ${inserted} new (total: ${totalInserted})`);
+  } catch (err) {
+    console.log(`Check failed: ${err.message}`);
+  }
+}
+
+async function main() {
+  console.log('Sacred Cube Loadboard Monitor v2.2');
+  console.log(`  Origin: ${CONFIG.origin} | Equipment: ${CONFIG.equipmentTypes.join(',')}`);
+  console.log(`  Interval: ${CONFIG.intervalMs / 1000}s | DB: ${CONFIG.databaseUrl ? 'YES' : 'NO'}`);
+  console.log(`  Proxy: ${CONFIG.proxyUser ? CONFIG.proxyUser + '@' + CONFIG.proxyHost + ':' + CONFIG.proxyPort : 'NONE'}`);
+  console.log(`  Pass length: ${CONFIG.proxyPass ? CONFIG.proxyPass.length : 0} chars`);
+
+  // Test proxy first
+  await testProxy();
+
+  await login();
+  await runCheck();
+
+  console.log(`Running every ${CONFIG.intervalMs / 1000}s. Ctrl+C to stop.`);
+  setInterval(runCheck, CONFIG.intervalMs);
+}
+
+main().catch(err => {
+  console.error('Fatal:', err);
+  process.exit(1);
+});/**
  * Autonomous Sacred Cube Loadboard Monitor v2.1 (Railway Edition)
  * Fixed: Manual cookie management instead of axios-cookiejar-support
  */
