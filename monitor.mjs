@@ -62,6 +62,16 @@ async function testProxy() {
     });
     const body = await res.text();
     console.log(`  Status: ${res.status}`);
+    if (res.status === 407) {
+      console.error(`  PROXY AUTH REJECTED (407)`);
+      console.error(`  Response body: ${body.substring(0, 500)}`);
+      console.error(`  Response headers: ${JSON.stringify(Object.fromEntries(res.headers.entries()))}`);
+      return false;
+    }
+    if (res.status >= 400) {
+      console.error(`  Proxy returned error status ${res.status}: ${body.substring(0, 200)}`);
+      return false;
+    }
     console.log(`  IP:     ${body.trim()}`);
     console.log('  Proxy is WORKING');
     return true;
@@ -119,6 +129,13 @@ async function login() {
   console.log('Step 1: GET /login');
   const loginPage = await proxyFetch('https://access-control.sacredcube.co/login');
   console.log(`  Status: ${loginPage.status}`);
+  if (loginPage.status === 407) {
+    const errBody = await loginPage.text();
+    console.error(`  PROXY AUTH FAILED on login page!`);
+    console.error(`  407 body: ${errBody.substring(0, 500)}`);
+    console.error(`  Headers: ${JSON.stringify(Object.fromEntries(loginPage.headers.entries()))}`);
+    throw new Error('Proxy returned 407 - authentication rejected');
+  }
   sessionCookies = extractCookies(loginPage.headers);
 
   const html = await loginPage.text();
@@ -302,7 +319,7 @@ async function runCheck() {
 
 // ── Main ────────────────────────────────────────────────────────────────
 async function main() {
-  console.log('Loadboard Monitor v2.5 starting...');
+  console.log('Loadboard Monitor v2.6 starting...');
   console.log(`Email: ${CONFIG.scEmail}`);
   console.log(`Proxy: ${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
   console.log(`Proxy user: ${CONFIG.proxyUser}`);
