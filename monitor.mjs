@@ -24,8 +24,12 @@ let csrfToken = '';
 let _proxyAgent = null;
 function getProxyAgent() {
   if (_proxyAgent) return _proxyAgent;
-  const proxyUrl = `http://${CONFIG.proxyUser}:${CONFIG.proxyPass}@${CONFIG.proxyHost}:${CONFIG.proxyPort}`;
-  console.log(`  Proxy URL: http://${CONFIG.proxyUser}:${CONFIG.proxyPass.substring(0,6)}****@${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
+  const encodedUser = encodeURIComponent(CONFIG.proxyUser);
+  const encodedPass = encodeURIComponent(CONFIG.proxyPass);
+  const proxyUrl = `http://${encodedUser}:${encodedPass}@${CONFIG.proxyHost}:${CONFIG.proxyPort}`;
+  console.log(`  Proxy URL: http://${encodedUser}:${encodedPass.substring(0,10)}****@${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
+  console.log(`  Raw password: ${CONFIG.proxyPass}`);
+  console.log(`  Encoded password: ${encodedPass}`);
   _proxyAgent = new HttpsProxyAgent(proxyUrl);
   return _proxyAgent;
 }
@@ -319,7 +323,7 @@ async function runCheck() {
 
 // ── Main ────────────────────────────────────────────────────────────────
 async function main() {
-  console.log('Loadboard Monitor v2.6 starting...');
+  console.log('Loadboard Monitor v2.7 starting...');
   console.log(`Email: ${CONFIG.scEmail}`);
   console.log(`Proxy: ${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
   console.log(`Proxy user: ${CONFIG.proxyUser}`);
