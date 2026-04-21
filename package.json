@@ -1,14 +1,15 @@
 {
-    "name": "loadboard-monitor",
-    "version": "2.3.0",
-    "type": "module",
-    "main": "monitor.mjs",
-    "scripts": {
-          "start": "node monitor.mjs"
-    },
-    "dependencies": {
-          "cheerio": "^1.0.0-rc.12",
-          "pg": "^8.11.3",
-          "undici": "^6.6.2"
-    }
+  "name": "loadboard-monitor",
+  "version": "2.5.0",
+  "type": "module",
+  "main": "monitor.mjs",
+  "scripts": {
+    "start": "node monitor.mjs"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "https-proxy-agent": "^7.0.4",
+    "node-fetch": "^3.3.2",
+    "pg": "^8.11.3"
+  }
 }
