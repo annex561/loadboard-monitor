@@ -180,9 +180,17 @@ async function login() {
   const newCsrf = $tms('meta[name="csrf-token"]').attr('content') || $tms('input[name="_token"]').val();
   if (newCsrf) {
     csrfToken = newCsrf;
-    console.log(`  Updated CSRF: ${csrfToken.substring(0, 10)}...`);
+    console.log(`  Updated CSRF from HTML: ${csrfToken.substring(0, 10)}...`);
   } else {
-    console.log(`  No new CSRF found in TMS page, keeping original`);
+    // TMS page may not have meta tag â extract XSRF-TOKEN from cookie instead
+    // Laravel accepts X-XSRF-TOKEN header with the encrypted cookie value
+    const xsrfMatch = sessionCookies.match(/XSRF-TOKEN=([^;]+)/);
+    if (xsrfMatch) {
+      csrfToken = decodeURIComponent(xsrfMatch[1]);
+      console.log(`  Updated CSRF from XSRF-TOKEN cookie: ${csrfToken.substring(0, 20)}...`);
+    } else {
+      console.log(`  No CSRF found in TMS page or cookies, keeping original`);
+    }
   }
   console.log(`  Cookies: ${sessionCookies.substring(0, 60)}...`);
   console.log('Login complete.');
@@ -223,7 +231,7 @@ async function searchLoadboard() {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
           'Cookie': sessionCookies,
-          'X-CSRF-TOKEN': csrfToken,
+          'X-XSRF-TOKEN': csrfToken,
           'X-Requested-With': 'XMLHttpRequest',
           'Referer': 'https://access-control.sacredcube.co/tms',
         },
@@ -344,7 +352,7 @@ async function runCheck() {
 
 // ââ Main ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function main() {
-  console.log('Loadboard Monitor v2.8 starting...');
+  console.log('Loadboard Monitor v2.9 starting...');
   console.log(`Email: ${CONFIG.scEmail}`);
   console.log(`Proxy: ${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
   console.log(`Proxy user: ${CONFIG.proxyUser}`);
