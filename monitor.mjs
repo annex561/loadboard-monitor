@@ -5,7 +5,7 @@ import net from 'net';
 import fetch from 'node-fetch';
 const { Client } = pg;
 
-// ── Config ──────────────────────────────────────────────────────────────
+// ââ Config ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 const CONFIG = {
   scEmail:    process.env.SC_EMAIL    || 'annex561@gmail.com',
   scPassword: process.env.SC_PASSWORD || '',
@@ -20,7 +20,7 @@ const CONFIG = {
 let sessionCookies = '';
 let csrfToken = '';
 
-// ── Singleton proxy agent ───────────────────────────────────────────────
+// ââ Singleton proxy agent âââââââââââââââââââââââââââââââââââââââââââââââ
 let _proxyAgent = null;
 function getProxyAgent() {
   if (_proxyAgent) return _proxyAgent;
@@ -34,7 +34,7 @@ function getProxyAgent() {
   return _proxyAgent;
 }
 
-// ── Raw TCP connectivity test ───────────────────────────────────────────
+// ââ Raw TCP connectivity test âââââââââââââââââââââââââââââââââââââââââââ
 function testTcpConnect(host, port, timeoutMs = 10000) {
   return new Promise((resolve) => {
     const sock = new net.Socket();
@@ -46,7 +46,7 @@ function testTcpConnect(host, port, timeoutMs = 10000) {
   });
 }
 
-// ── Test proxy connectivity ─────────────────────────────────────────────
+// ââ Test proxy connectivity âââââââââââââââââââââââââââââââââââââââââââââ
 async function testProxy() {
   console.log('\n=== PROXY CONNECTIVITY TEST ===');
 
@@ -88,7 +88,7 @@ async function testProxy() {
   }
 }
 
-// ── Cookie helper ───────────────────────────────────────────────────────
+// ââ Cookie helper âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 function extractCookies(headers) {
   const raw = headers.raw ? headers.raw()['set-cookie'] : [];
   if (!raw || !raw.length) return '';
@@ -109,7 +109,7 @@ function mergeCookies(existing, incoming) {
   return Object.values(map).join('; ');
 }
 
-// ── Fetch helper with proxy ────────────────────────────────────────────
+// ââ Fetch helper with proxy ââââââââââââââââââââââââââââââââââââââââââââ
 async function proxyFetch(url, options = {}) {
   const agent = getProxyAgent();
   const merged = {
@@ -125,11 +125,11 @@ async function proxyFetch(url, options = {}) {
   return fetch(url, merged);
 }
 
-// ── Login ───────────────────────────────────────────────────────────────
+// ââ Login âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function login() {
   console.log('\n=== LOGIN FLOW ===');
 
-  // Step 1 — GET login page
+  // Step 1 â GET login page
   console.log('Step 1: GET /login');
   const loginPage = await proxyFetch('https://access-control.sacredcube.co/login');
   console.log(`  Status: ${loginPage.status}`);
@@ -147,7 +147,7 @@ async function login() {
   csrfToken = $('meta[name="csrf-token"]').attr('content') || $('input[name="_token"]').val();
   console.log(`  CSRF: ${csrfToken ? csrfToken.substring(0, 10) + '...' : 'NOT FOUND'}`);
 
-  // Step 2 — POST login
+  // Step 2 â POST login
   console.log('Step 2: POST /login');
   const loginRes = await proxyFetch('https://access-control.sacredcube.co/login', {
     method: 'POST',
@@ -167,19 +167,28 @@ async function login() {
   // Consume body even if we don't need it (prevents resource leak)
   await loginRes.text();
 
-  // Step 3 — Follow redirect to TMS
+  // Step 3 â Follow redirect to TMS
   console.log('Step 3: GET /tms (follow redirect)');
   const tmsPage = await proxyFetch('https://access-control.sacredcube.co/tms', {
     headers: { 'Cookie': sessionCookies },
   });
   console.log(`  Status: ${tmsPage.status}`);
   sessionCookies = mergeCookies(sessionCookies, extractCookies(tmsPage.headers));
-  await tmsPage.text(); // consume body
+  const tmsHtml = await tmsPage.text();
+  // Re-extract CSRF token from the post-login page (it changes after login)
+  const $tms = cheerio.load(tmsHtml);
+  const newCsrf = $tms('meta[name="csrf-token"]').attr('content') || $tms('input[name="_token"]').val();
+  if (newCsrf) {
+    csrfToken = newCsrf;
+    console.log(`  Updated CSRF: ${csrfToken.substring(0, 10)}...`);
+  } else {
+    console.log(`  No new CSRF found in TMS page, keeping original`);
+  }
   console.log(`  Cookies: ${sessionCookies.substring(0, 60)}...`);
   console.log('Login complete.');
 }
 
-// ── Search payload ──────────────────────────────────────────────────────
+// ââ Search payload ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 function buildPayload() {
   return {
     user: { id: 202, name: "Annex Luberisse" },
@@ -200,7 +209,7 @@ function buildPayload() {
   };
 }
 
-// ── Loadboard search ────────────────────────────────────────────────────
+// ââ Loadboard search ââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function searchLoadboard() {
   console.log('\n=== SEARCHING LOADBOARD ===');
   const payload = buildPayload();
@@ -222,7 +231,19 @@ async function searchLoadboard() {
       }
     );
     console.log(`  Status: ${res.status}`);
-    const data = await res.json();
+    const rawText = await res.text();
+    // Check if response is actually JSON
+    if (rawText.trim().startsWith('<') || rawText.trim().startsWith('<!')) {
+      console.error(`  Search returned HTML instead of JSON!`);
+      console.error(`  First 300 chars: ${rawText.substring(0, 300)}`);
+      console.error(`  This usually means the session expired or CSRF token is invalid.`);
+      // Try to re-login next cycle
+      sessionCookies = '';
+      csrfToken = '';
+      _proxyAgent = null;
+      return null;
+    }
+    const data = JSON.parse(rawText);
     if (Array.isArray(data)) {
       console.log(`  Results: ${data.length} loads`);
     } else if (data && data.data) {
@@ -237,7 +258,7 @@ async function searchLoadboard() {
   }
 }
 
-// ── Extract loads ───────────────────────────────────────────────────────
+// ââ Extract loads âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 function extractLoads(apiData) {
   if (!apiData) return [];
   const arr = Array.isArray(apiData) ? apiData : (apiData.data || []);
@@ -256,7 +277,7 @@ function extractLoads(apiData) {
   }));
 }
 
-// ── Insert new loads ────────────────────────────────────────────────────
+// ââ Insert new loads ââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function insertNewLoads(loads) {
   if (!loads.length) { console.log('No loads to insert.'); return; }
   console.log(`\n=== INSERTING ${loads.length} LOADS ===`);
@@ -303,7 +324,7 @@ async function insertNewLoads(loads) {
   console.log(`  Inserted: ${inserted}, Skipped (dupes): ${skipped}`);
 }
 
-// ── Run one check ───────────────────────────────────────────────────────
+// ââ Run one check âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function runCheck() {
   console.log(`\n${'='.repeat(60)}`);
   console.log(`CHECK @ ${new Date().toISOString()}`);
@@ -321,9 +342,9 @@ async function runCheck() {
   }
 }
 
-// ── Main ────────────────────────────────────────────────────────────────
+// ââ Main ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function main() {
-  console.log('Loadboard Monitor v2.7 starting...');
+  console.log('Loadboard Monitor v2.8 starting...');
   console.log(`Email: ${CONFIG.scEmail}`);
   console.log(`Proxy: ${CONFIG.proxyHost}:${CONFIG.proxyPort}`);
   console.log(`Proxy user: ${CONFIG.proxyUser}`);
@@ -333,7 +354,7 @@ async function main() {
   // Test proxy first
   const proxyOk = await testProxy();
   if (!proxyOk) {
-    console.error('\nProxy test failed — will still attempt login...');
+    console.error('\nProxy test failed â will still attempt login...');
   }
 
   // First run
